@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	maxCodeSize     = 10 * 1024        // 10 KB
-	maxInputSize    = 10 * 1024        // 10 KB
-	maxOutputSize   = 1 * 1024 * 1024  // 1 MB
-	compileTimeout  = 30 * time.Second // Compilation
-	runTimeout      = 5 * time.Second  // User program
+	maxCodeSize   = 10 * 1024        // 10 KB
+	maxInputSize  = 10 * 1024        // 10 KB
+	maxOutputSize = 1 * 1024 * 1024  // 1 MB
+
+	compileTimeout = 90 * time.Second
+	runTimeout     = 5 * time.Second
 )
 
 type RunRequest struct {
@@ -34,24 +35,28 @@ type RunResponse struct {
 	Runtime  int64  `json:"runtimeMs"`
 }
 
-type LimitBuffer struct {
-	Buffer bytes.Buffer
-	Limit  int
+type LimitedBuffer struct {
+	Buffer    bytes.Buffer
+	Limit     int
+	Truncated bool
 }
 
-func (b *LimitBuffer) Write(p []byte) (int, error) {
+func (b *LimitedBuffer) Write(p []byte) (int, error) {
 	remaining := b.Limit - b.Buffer.Len()
 
-	if remaining > 0 {
-		if len(p) > remaining {
-			p = p[:remaining]
-		}
-
-		_, _ = b.Buffer.Write(p)
+	if remaining <= 0 {
+		b.Truncated = true
+		return len(p), nil
 	}
 
-	// Pretend all bytes were consumed so the process
-	// does not fail just because output exceeded our limit.
+	if len(p) > remaining {
+		_, _ = b.Buffer.Write(p[:remaining])
+		b.Truncated = true
+		return len(p), nil
+	}
+
+	_, _ = b.Buffer.Write(p)
+
 	return len(p), nil
 }
 
@@ -59,16 +64,22 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 
-	_ = json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("JSON encode error: %v", err)
+	}
 }
 
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		frontendURL := os.Getenv("FRONTEND_URL")
 
-		// Development frontend
+		if frontendURL == "" {
+			frontendURL = "http://localhost:3000"
+		}
+
 		w.Header().Set(
 			"Access-Control-Allow-Origin",
-			"http://localhost:3000",
+			frontendURL,
 		)
 
 		w.Header().Set(
@@ -111,11 +122,14 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit request body.
+	r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
+
 	var req RunRequest
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "Invalid JSON",
+			"error": "Invalid request body",
 		})
 		return
 	}
@@ -131,26 +145,29 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Code) > maxCodeSize {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "Code too large",
+			"error": "Code too large. Maximum size is 10 KB.",
 		})
 		return
 	}
 
 	if len(req.Input) > maxInputSize {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "Input too large",
+			"error": "Input too large. Maximum size is 10 KB.",
 		})
 		return
 	}
 
 	log.Println("========== NEW RUN ==========")
-	log.Printf("Code size: %d bytes\n", len(req.Code))
-	log.Printf("Input size: %d bytes\n", len(req.Input))
+	log.Printf("Code size: %d bytes", len(req.Code))
+	log.Printf("Input size: %d bytes", len(req.Input))
 
+	// ---------------------------------------------------------
 	// Temporary workspace
+	// ---------------------------------------------------------
+
 	dir, err := os.MkdirTemp("", "golab-*")
 	if err != nil {
-		log.Printf("ERROR creating temp directory: %v\n", err)
+		log.Printf("Workspace error: %v", err)
 
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "Could not create workspace",
@@ -160,12 +177,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	defer os.RemoveAll(dir)
 
-	log.Printf("Workspace: %s\n", dir)
-
 	source := filepath.Join(dir, "main.go")
 
 	if err := os.WriteFile(source, []byte(req.Code), 0600); err != nil {
-		log.Printf("ERROR writing source: %v\n", err)
+		log.Printf("File write error: %v", err)
 
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "Could not write source file",
@@ -173,47 +188,37 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("Source written successfully")
+	log.Printf("Workspace: %s", dir)
 
-	// Check Go installation
-	versionCmd := exec.Command("go", "version")
+	// ---------------------------------------------------------
+	// Detect OS
+	// ---------------------------------------------------------
 
-	versionOutput, versionErr := versionCmd.CombinedOutput()
-
-	if versionErr != nil {
-		log.Printf("ERROR running 'go version': %v\n", versionErr)
-		log.Printf("Output: %s\n", string(versionOutput))
-	} else {
-		log.Printf("Go: %s\n", strings.TrimSpace(string(versionOutput)))
-	}
-
-	// Binary name
 	binaryName := "program"
 
 	if runtime.GOOS == "windows" {
-		binaryName = "program.exe"
+		binaryName += ".exe"
 	}
 
 	binary := filepath.Join(dir, binaryName)
 
 	// ---------------------------------------------------------
-	// COMPILE
+	// Compilation
 	// ---------------------------------------------------------
 
 	log.Println("Starting compilation...")
 
 	compileCtx, compileCancel := context.WithTimeout(
 		context.Background(),
-		60*time.Second,
+		compileTimeout,
 	)
 	defer compileCancel()
-
-	compileStart := time.Now()
 
 	compileCmd := exec.CommandContext(
 		compileCtx,
 		"go",
 		"build",
+		"-trimpath",
 		"-o",
 		binary,
 		source,
@@ -221,53 +226,74 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	compileCmd.Dir = dir
 
-	compileOutput, err := compileCmd.CombinedOutput()
-
-	compileDuration := time.Since(compileStart)
-
-	log.Printf(
-		"Compilation finished after %d ms\n",
-		compileDuration.Milliseconds(),
+	compileCmd.Env = append(
+		os.Environ(),
+		"GOTOOLCHAIN=local",
+		"CGO_ENABLED=0",
 	)
 
-	if len(compileOutput) > maxOutputSize {
-		compileOutput = compileOutput[:maxOutputSize]
-	}
+	var compileStdout LimitedBuffer
+	var compileStderr LimitedBuffer
 
-	log.Printf("Compile output: %s\n", string(compileOutput))
+	compileStdout.Limit = maxOutputSize
+	compileStderr.Limit = maxOutputSize
 
+	compileCmd.Stdout = &compileStdout
+	compileCmd.Stderr = &compileStderr
+
+	compileStart := time.Now()
+
+	err = compileCmd.Run()
+
+	compileRuntime := time.Since(compileStart).Milliseconds()
+
+	log.Printf(
+		"Compilation finished in %d ms",
+		compileRuntime,
+	)
+
+	// Compilation timeout.
 	if compileCtx.Err() == context.DeadlineExceeded {
 		log.Println("COMPILATION TIMEOUT")
 
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
-			Stderr:   "Compilation timed out after 60 seconds.",
+			Stderr:   "Compilation timed out.",
 			ExitCode: 124,
-			Runtime:  compileDuration.Milliseconds(),
+			Runtime:  compileRuntime,
 		})
 		return
 	}
 
+	// Compilation error.
 	if err != nil {
-		log.Printf("COMPILATION ERROR: %v\n", err)
+		log.Printf(
+			"Compilation failed: %v",
+			err,
+		)
+
+		stderr := compileStderr.Buffer.String()
+
+		if stderr == "" {
+			stderr = compileStdout.Buffer.String()
+		}
 
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
-			Stderr:   string(compileOutput),
+			Stderr:   stderr,
 			ExitCode: 1,
-			Runtime:  compileDuration.Milliseconds(),
+			Runtime:  compileRuntime,
 		})
 		return
 	}
 
 	log.Println("Compilation successful")
-	log.Printf("Binary: %s\n", binary)
 
 	// ---------------------------------------------------------
-	// EXECUTE
+	// Execution
 	// ---------------------------------------------------------
 
-	log.Println("Starting program execution...")
+	log.Println("Starting execution...")
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -275,14 +301,24 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 	)
 	defer cancel()
 
-	runCmd := exec.CommandContext(ctx, binary)
+	runCmd := exec.CommandContext(
+		ctx,
+		binary,
+	)
+
 	runCmd.Dir = dir
+
+	// stdin
 	runCmd.Stdin = strings.NewReader(req.Input)
 
-	var output bytes.Buffer
+	var stdout LimitedBuffer
+	var stderr LimitedBuffer
 
-	runCmd.Stdout = &output
-	runCmd.Stderr = &output
+	stdout.Limit = maxOutputSize
+	stderr.Limit = maxOutputSize
+
+	runCmd.Stdout = &stdout
+	runCmd.Stderr = &stderr
 
 	start := time.Now()
 
@@ -290,14 +326,12 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	runtimeMs := time.Since(start).Milliseconds()
 
-	result := output.Bytes()
+	log.Printf(
+		"Execution finished in %d ms",
+		runtimeMs,
+	)
 
-	if len(result) > maxOutputSize {
-		result = result[:maxOutputSize]
-	}
-
-	log.Printf("Execution finished after %d ms\n", runtimeMs)
-
+	// Timeout.
 	if ctx.Err() == context.DeadlineExceeded {
 		log.Println("EXECUTION TIMEOUT")
 
@@ -310,25 +344,28 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Runtime error / panic.
 	if err != nil {
-		log.Printf("RUNTIME ERROR: %v\n", err)
-		log.Printf("Output: %s\n", string(result))
+		log.Printf(
+			"Runtime error: %v",
+			err,
+		)
 
 		writeJSON(w, http.StatusOK, RunResponse{
-			Stdout:   "",
-			Stderr:   string(result),
+			Stdout:   stdout.Buffer.String(),
+			Stderr:   stderr.Buffer.String(),
 			ExitCode: 1,
 			Runtime:  runtimeMs,
 		})
 		return
 	}
 
+	// Success.
 	log.Println("EXECUTION SUCCESS")
-	log.Printf("Output: %s\n", string(result))
 
 	writeJSON(w, http.StatusOK, RunResponse{
-		Stdout:   string(result),
-		Stderr:   "",
+		Stdout:   stdout.Buffer.String(),
+		Stderr:   stderr.Buffer.String(),
 		ExitCode: 0,
 		Runtime:  runtimeMs,
 	})
@@ -348,12 +385,11 @@ func main() {
 		port = "8080"
 	}
 
-	println("GoLab runner running on port " + port)
+	address := "0.0.0.0:" + port
 
-	if err := http.ListenAndServe(
-		"0.0.0.0:"+port,
-		handler,
-	); err != nil {
-		panic(err)
+	log.Printf("GoLab runner running on %s", address)
+
+	if err := http.ListenAndServe(address, handler); err != nil {
+		log.Fatal(err)
 	}
 }
