@@ -29,39 +29,65 @@ export default function Home() {
   const [running, setRunning] = useState(false);
 
   async function runCode() {
-    setRunning(true);
-    setOutput("Running...");
+  setRunning(true);
+  setOutput("Running...");
+
+  try {
+    const runnerURL =
+      process.env.NEXT_PUBLIC_RUNNER_URL || "http://localhost:8080";
+
+    const response = await fetch(`${runnerURL}/run`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        code,
+        input,
+      }),
+    });
+
+    const raw = await response.text();
+
+    console.log("Runner status:", response.status);
+    console.log("Runner response:", raw);
+
+    if (!response.ok) {
+      setOutput(
+        `Runner error (${response.status})\n\n${raw}`
+      );
+      return;
+    }
+
+    let data: RunResponse;
 
     try {
-      const response = await fetch("http://localhost:8080/run", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          code,
-          input,
-        }),
-      });
-
-      const data: RunResponse = await response.json();
-
-      if (data.exitCode === 0) {
-        setOutput(
-          `${data.stdout}\n✓ Finished in ${data.runtimeMs} ms`
-        );
-      } else {
-        setOutput(
-          `${data.stderr}\n✗ Failed`
-        );
-      }
-    } catch (error) {
-      console.error(error);
-      setOutput("Could not connect to GoLab runner.");
-    } finally {
-      setRunning(false);
+      data = JSON.parse(raw);
+    } catch {
+      setOutput(
+        `Runner returned invalid JSON:\n\n${raw}`
+      );
+      return;
     }
+
+    if (data.exitCode === 0) {
+      setOutput(
+        `${data.stdout}\n✓ Finished in ${data.runtimeMs} ms`
+      );
+    } else {
+      setOutput(
+        `${data.stderr}\n✗ Failed`
+      );
+    }
+  } catch (error) {
+    console.error(error);
+    setOutput(
+      "Could not connect to GoLab runner."
+    );
+  } finally {
+    setRunning(false);
   }
+}
 
   return (
     <main className="min-h-screen bg-[#0d1117] text-white p-6">

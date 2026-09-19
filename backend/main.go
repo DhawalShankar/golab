@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	maxCodeSize   = 10 * 1024       // 10 KB
-	maxInputSize  = 10 * 1024       // 10 KB
-	maxOutputSize = 1 * 1024 * 1024 // 1 MB
-	runTimeout    = 5 * time.Second
+	maxCodeSize     = 10 * 1024        // 10 KB
+	maxInputSize    = 10 * 1024        // 10 KB
+	maxOutputSize   = 1 * 1024 * 1024  // 1 MB
+	compileTimeout  = 30 * time.Second // Compilation
+	runTimeout      = 5 * time.Second  // User program
 )
 
 type RunRequest struct {
@@ -32,26 +33,24 @@ type RunResponse struct {
 	Runtime  int64  `json:"runtimeMs"`
 }
 
-type LimitWriter struct {
+type LimitBuffer struct {
 	Buffer bytes.Buffer
 	Limit  int
 }
 
-func (w *LimitWriter) Write(p []byte) (int, error) {
-	remaining := w.Limit - w.Buffer.Len()
+func (b *LimitBuffer) Write(p []byte) (int, error) {
+	remaining := b.Limit - b.Buffer.Len()
 
-	if remaining <= 0 {
-		return len(p), nil
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+
+		_, _ = b.Buffer.Write(p)
 	}
 
-	if len(p) > remaining {
-		p = p[:remaining]
-	}
-
-	_, _ = w.Buffer.Write(p)
-
-	// Tell the process that it can continue.
-	// We intentionally truncate output instead of failing.
+	// Pretend all bytes were consumed so the process
+	// does not fail just because output exceeded our limit.
 	return len(p), nil
 }
 
@@ -64,6 +63,8 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		// Development frontend
 		w.Header().Set(
 			"Access-Control-Allow-Origin",
 			"http://localhost:3000",
@@ -120,6 +121,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	req.Code = strings.TrimSpace(req.Code)
 
+	// -----------------------------
+	// Validate input
+	// -----------------------------
+
 	if req.Code == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "Code cannot be empty",
@@ -141,7 +146,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create a temporary workspace.
+	// -----------------------------
+	// Temporary workspace
+	// -----------------------------
+
 	dir, err := os.MkdirTemp("", "golab-*")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
@@ -152,7 +160,6 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	defer os.RemoveAll(dir)
 
-	// Write submitted source code.
 	source := filepath.Join(dir, "main.go")
 
 	if err := os.WriteFile(source, []byte(req.Code), 0600); err != nil {
@@ -162,7 +169,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Windows requires .exe; Linux does not.
+	// -----------------------------
+	// Binary name
+	// -----------------------------
+
 	binaryName := "program"
 
 	if runtime.GOOS == "windows" {
@@ -171,13 +181,13 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	binary := filepath.Join(dir, binaryName)
 
-	// ---------------------------------------------------------
+	// -----------------------------
 	// Compile
-	// ---------------------------------------------------------
+	// -----------------------------
 
 	compileCtx, compileCancel := context.WithTimeout(
 		context.Background(),
-		runTimeout,
+		compileTimeout,
 	)
 	defer compileCancel()
 
@@ -192,24 +202,26 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	compileCmd.Dir = dir
 
-	var compileOutput LimitWriter
+	var compileOutput LimitBuffer
 	compileOutput.Limit = maxOutputSize
 
-	compileCmd.Stdout = &compileOutput.Buffer
-	compileCmd.Stderr = &compileOutput.Buffer
+	compileCmd.Stdout = &compileOutput
+	compileCmd.Stderr = &compileOutput
 
 	err = compileCmd.Run()
 
+	// Compilation timeout
 	if compileCtx.Err() == context.DeadlineExceeded {
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
-			Stderr:   "Compilation timed out.",
+			Stderr:   "Compilation timed out after 30 seconds.",
 			ExitCode: 124,
-			Runtime:  0,
+			Runtime:  compileTimeout.Milliseconds(),
 		})
 		return
 	}
 
+	// Compilation error
 	if err != nil {
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
@@ -220,9 +232,9 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---------------------------------------------------------
+	// -----------------------------
 	// Execute
-	// ---------------------------------------------------------
+	// -----------------------------
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -231,16 +243,17 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	runCmd := exec.CommandContext(ctx, binary)
+
 	runCmd.Dir = dir
 
-	// Send user input to stdin.
+	// stdin
 	runCmd.Stdin = strings.NewReader(req.Input)
 
-	var output LimitWriter
+	var output LimitBuffer
 	output.Limit = maxOutputSize
 
-	runCmd.Stdout = &output.Buffer
-	runCmd.Stderr = &output.Buffer
+	runCmd.Stdout = &output
+	runCmd.Stderr = &output
 
 	start := time.Now()
 
@@ -248,7 +261,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	runtimeMs := time.Since(start).Milliseconds()
 
-	// Timeout.
+	// -----------------------------
+	// Execution timeout
+	// -----------------------------
+
 	if ctx.Err() == context.DeadlineExceeded {
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
@@ -259,7 +275,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Runtime error / panic.
+	// -----------------------------
+	// Runtime error / panic
+	// -----------------------------
+
 	if err != nil {
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
@@ -270,7 +289,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Successful execution.
+	// -----------------------------
+	// Success
+	// -----------------------------
+
 	writeJSON(w, http.StatusOK, RunResponse{
 		Stdout:   output.Buffer.String(),
 		Stderr:   "",
@@ -288,13 +310,17 @@ func main() {
 	handler := enableCORS(mux)
 
 	port := os.Getenv("PORT")
+
 	if port == "" {
 		port = "8080"
 	}
 
 	println("GoLab runner running on port " + port)
 
-	if err := http.ListenAndServe("0.0.0.0:"+port, handler); err != nil {
+	if err := http.ListenAndServe(
+		"0.0.0.0:"+port,
+		handler,
+	); err != nil {
 		panic(err)
 	}
 }
