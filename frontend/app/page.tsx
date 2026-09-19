@@ -77,8 +77,6 @@ export default function Home() {
       console.error(err);
       setState("connection-error");
       setStderr("could not reach the GoLab runner. is it running?");
-    } finally {
-      // no-op: state already resolved above
     }
   }
 
@@ -95,7 +93,7 @@ export default function Home() {
       {/* Header */}
       <header className="golab-header">
         <div className="golab-brand">
-          <Image src="/logo.svg" alt="" width={60} height={60} priority />
+          <Image src="/logo.svg" alt="" width={30} height={30} priority />
           <div className="golab-brand-text">
             <span className="golab-name">GoLab</span>
             <span className="golab-by">by GolangForAll</span>
@@ -114,7 +112,7 @@ export default function Home() {
       <div className="golab-grid">
         {/* Left column */}
         <section className="golab-col">
-          <div className="term-window">
+          <div className="term-window editor-window">
             <div className="term-bar">
               <div className="term-dots">
                 <span className="dot dot-red" />
@@ -122,37 +120,51 @@ export default function Home() {
                 <span className="dot dot-green" />
               </div>
               <span className="term-path">main.go</span>
-              <span className="term-lang">go</span>
+
+              <button
+                onClick={runCode}
+                disabled={isRunning}
+                className="run-btn"
+                aria-label="Run Go program"
+              >
+                <span className="run-caret">{isRunning ? "…" : "$"}</span>
+                <span className="run-cmd">
+                  {isRunning ? "running" : "go run"}
+                </span>
+              </button>
             </div>
-            <Editor
-              height="52vh"
-              language="go"
-              theme="golab-dark"
-              value={code}
-              onChange={(value) => setCode(value ?? "")}
-              beforeMount={(monaco) => {
-                monaco.editor.defineTheme("golab-dark", {
-                  base: "vs-dark",
-                  inherit: true,
-                  rules: [],
-                  colors: {
-                    "editor.background": "#0d1117",
-                  },
-                });
-              }}
-              options={{
-                minimap: { enabled: false },
-                fontSize: 14.5,
-                fontFamily:
-                  "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
-                lineNumbers: "on",
-                wordWrap: "on",
-                automaticLayout: true,
-                tabSize: 4,
-                scrollBeyondLastLine: false,
-                padding: { top: 14, bottom: 14 },
-              }}
-            />
+
+            <div className="editor-wrap">
+              <Editor
+                height="100%"
+                language="go"
+                theme="golab-dark"
+                value={code}
+                onChange={(value) => setCode(value ?? "")}
+                beforeMount={(monaco) => {
+                  monaco.editor.defineTheme("golab-dark", {
+                    base: "vs-dark",
+                    inherit: true,
+                    rules: [],
+                    colors: {
+                      "editor.background": "#0d1117",
+                    },
+                  });
+                }}
+                options={{
+                  minimap: { enabled: false },
+                  fontSize: 14,
+                  fontFamily:
+                    "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+                  lineNumbers: "on",
+                  wordWrap: "on",
+                  automaticLayout: true,
+                  tabSize: 4,
+                  scrollBeyondLastLine: false,
+                  padding: { top: 12, bottom: 12 },
+                }}
+              />
+            </div>
           </div>
 
           <div className="term-window term-window-input">
@@ -168,19 +180,6 @@ export default function Home() {
               spellCheck={false}
             />
           </div>
-
-          <button
-            onClick={runCode}
-            disabled={isRunning}
-            className="run-prompt"
-            aria-label="Run Go program"
-          >
-            <span className="run-caret">{isRunning ? "…" : "$"}</span>
-            <span className="run-cmd">
-              {isRunning ? "compiling and running" : "go run main.go"}
-            </span>
-            {!isRunning && <span className="run-blink" aria-hidden />}
-          </button>
         </section>
 
         {/* Right column */}
@@ -235,62 +234,71 @@ export default function Home() {
           --green: #3fb950;
           --red: #f85149;
           --amber: #d29922;
+          --header-h: 52px;
+          --stdin-h: 96px;
+          --gap: 12px;
         }
 
         html,
         body {
           background: var(--bg);
+          height: 100%;
+          overflow: hidden;
         }
 
         .golab-root {
-          min-height: 100vh;
+          height: 100vh;
+          display: flex;
+          flex-direction: column;
           background: var(--bg);
           color: var(--text);
-          padding: 28px 32px 40px;
+          padding: 14px 20px;
           font-family: "JetBrains Mono", ui-monospace, SFMono-Regular,
             monospace;
+          box-sizing: border-box;
         }
 
         .golab-header {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          margin-bottom: 22px;
-          padding-bottom: 18px;
+          height: var(--header-h);
+          flex: 0 0 var(--header-h);
+          padding-bottom: 10px;
           border-bottom: 1px solid var(--panel-border);
         }
 
         .golab-brand {
           display: flex;
           align-items: center;
-          gap: 12px;
+          gap: 10px;
         }
 
         .golab-brand-text {
           display: flex;
           flex-direction: column;
-          line-height: 1.15;
+          line-height: 1.1;
         }
 
         .golab-name {
           font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-          font-size: 20px;
+          font-size: 17px;
           font-weight: 700;
           letter-spacing: -0.01em;
         }
 
         .golab-by {
-          font-size: 11.5px;
+          font-size: 10.5px;
           color: var(--muted);
-          margin-top: 2px;
+          margin-top: 1px;
         }
 
         .golab-link {
-          font-size: 13px;
+          font-size: 12px;
           color: var(--muted);
           text-decoration: none;
           border: 1px solid var(--panel-border);
-          padding: 6px 12px;
+          padding: 5px 10px;
           border-radius: 6px;
           transition: color 0.15s ease, border-color 0.15s ease;
         }
@@ -301,24 +309,27 @@ export default function Home() {
         }
 
         .golab-grid {
+          flex: 1;
+          min-height: 0;
           display: grid;
           grid-template-columns: 1fr;
-          gap: 18px;
-          max-width: 1360px;
-          margin: 0 auto;
+          gap: var(--gap);
+          max-width: 1440px;
+          width: 100%;
+          margin: 12px auto 0;
         }
 
         @media (min-width: 1024px) {
           .golab-grid {
             grid-template-columns: 1fr 420px;
-            align-items: start;
           }
         }
 
         .golab-col {
+          min-height: 0;
           display: flex;
           flex-direction: column;
-          gap: 16px;
+          gap: var(--gap);
         }
 
         .term-window {
@@ -326,21 +337,34 @@ export default function Home() {
           border-radius: 8px;
           overflow: hidden;
           background: var(--panel);
+          display: flex;
+          flex-direction: column;
+        }
+
+        .editor-window {
+          flex: 1;
+          min-height: 0;
+        }
+
+        .editor-wrap {
+          flex: 1;
+          min-height: 0;
         }
 
         .term-bar {
           display: flex;
           align-items: center;
           gap: 10px;
-          padding: 9px 14px;
+          padding: 8px 12px;
           border-bottom: 1px solid var(--panel-border);
           background: #11161d;
+          flex: 0 0 auto;
         }
 
         .term-dots {
           display: flex;
           gap: 6px;
-          margin-right: 4px;
+          margin-right: 2px;
         }
 
         .dot {
@@ -361,58 +385,39 @@ export default function Home() {
         }
 
         .term-path {
-          font-size: 12.5px;
+          font-size: 12px;
           color: var(--text);
           opacity: 0.85;
         }
 
-        .term-lang,
         .term-hint {
           margin-left: auto;
-          font-size: 11px;
+          font-size: 10.5px;
           color: var(--muted);
         }
 
-        .term-window-input .stdin-area {
-          width: 100%;
-          height: 96px;
-          resize: vertical;
-          border: none;
-          background: var(--panel);
-          color: var(--text);
-          font-family: inherit;
-          font-size: 13.5px;
-          padding: 14px;
-          outline: none;
-        }
-
-        .stdin-area::placeholder {
-          color: #3d444d;
-        }
-
-        .run-prompt {
+        .run-btn {
+          margin-left: auto;
           display: flex;
           align-items: center;
-          gap: 10px;
-          width: 100%;
-          text-align: left;
-          background: var(--panel);
+          gap: 6px;
+          background: transparent;
           border: 1px solid var(--panel-border);
-          border-radius: 8px;
-          padding: 13px 16px;
+          border-radius: 6px;
+          padding: 4px 10px;
           font-family: inherit;
-          font-size: 14px;
+          font-size: 12px;
           color: var(--text);
           cursor: pointer;
           transition: border-color 0.15s ease, background 0.15s ease;
         }
 
-        .run-prompt:hover:not(:disabled) {
+        .run-btn:hover:not(:disabled) {
           border-color: var(--cyan);
           background: #0f1720;
         }
 
-        .run-prompt:disabled {
+        .run-btn:disabled {
           cursor: not-allowed;
           opacity: 0.7;
         }
@@ -426,35 +431,35 @@ export default function Home() {
           color: var(--cyan);
         }
 
-        .run-blink {
-          width: 8px;
-          height: 16px;
-          background: var(--text);
-          margin-left: 2px;
-          animation: blink 1.1s steps(1) infinite;
+        .term-window-input {
+          flex: 0 0 var(--stdin-h);
         }
 
-        @keyframes blink {
-          0%,
-          49% {
-            opacity: 1;
-          }
-          50%,
-          100% {
-            opacity: 0;
-          }
+        .term-window-input .stdin-area {
+          flex: 1;
+          width: 100%;
+          resize: none;
+          border: none;
+          background: var(--panel);
+          color: var(--text);
+          font-family: inherit;
+          font-size: 13px;
+          padding: 10px 12px;
+          outline: none;
+        }
+
+        .stdin-area::placeholder {
+          color: #3d444d;
         }
 
         .golab-output {
-          display: flex;
-          flex-direction: column;
-          min-height: 100%;
+          min-height: 0;
         }
 
         .output-body {
           flex: 1;
-          min-height: 44vh;
-          padding: 16px;
+          min-height: 0;
+          padding: 14px;
           overflow: auto;
         }
 
@@ -470,8 +475,8 @@ export default function Home() {
         .output-stdout {
           white-space: pre-wrap;
           word-break: break-word;
-          font-size: 13.5px;
-          line-height: 1.6;
+          font-size: 13px;
+          line-height: 1.55;
           color: var(--text);
           margin: 0 0 12px;
         }
@@ -479,19 +484,20 @@ export default function Home() {
         .output-stderr {
           white-space: pre-wrap;
           word-break: break-word;
-          font-size: 13.5px;
-          line-height: 1.6;
+          font-size: 13px;
+          line-height: 1.55;
           color: var(--red);
           margin: 0;
         }
 
         .output-status {
+          flex: 0 0 auto;
           display: flex;
           gap: 20px;
-          padding: 10px 16px;
+          padding: 8px 14px;
           border-top: 1px solid var(--panel-border);
           background: #11161d;
-          font-size: 12px;
+          font-size: 11.5px;
           color: var(--muted);
         }
 
@@ -505,8 +511,8 @@ export default function Home() {
 
         .status-pill {
           margin-left: auto;
-          font-size: 11px;
-          padding: 3px 9px;
+          font-size: 10.5px;
+          padding: 2px 8px;
           border-radius: 100px;
           border: 1px solid var(--panel-border);
         }
@@ -528,10 +534,17 @@ export default function Home() {
           border-color: var(--red);
         }
 
-        @media (prefers-reduced-motion: reduce) {
-          .run-blink {
-            animation: none;
-            opacity: 1;
+        @media (max-width: 1023px) {
+          html,
+          body {
+            overflow: auto;
+          }
+          .golab-root {
+            height: auto;
+            overflow: visible;
+          }
+          .editor-window .editor-wrap {
+            min-height: 320px;
           }
         }
 
