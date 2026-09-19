@@ -9,19 +9,26 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	maxCodeSize   = 10 * 1024        // 10 KB
-	maxInputSize  = 10 * 1024        // 10 KB
-	maxOutputSize = 1 * 1024 * 1024  // 1 MB
+	maxCodeSize   = 10 * 1024       // 10 KB
+	maxInputSize  = 10 * 1024       // 10 KB
+	maxOutputSize = 1 * 1024 * 1024 // 1 MB
 
 	compileTimeout = 90 * time.Second
 	runTimeout     = 5 * time.Second
+
+	defaultCompilerImage = "golab-compiler:latest"
+	defaultRuntimeImage  = "golab-runtime:latest"
 )
+
+// Keep the MVP single-job for the small EC2 instance.
+var runLock sync.Mutex
 
 type RunRequest struct {
 	Code  string `json:"code"`
@@ -29,10 +36,13 @@ type RunRequest struct {
 }
 
 type RunResponse struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exitCode"`
-	Runtime  int64  `json:"runtimeMs"`
+	Stdout      string `json:"stdout"`
+	Stderr      string `json:"stderr"`
+	ExitCode    int    `json:"exitCode"`
+	Runtime     int64  `json:"runtimeMs"` // Backward-compatible field for the frontend.
+	CompileMs   int64  `json:"compileMs"`
+	ExecutionMs int64  `json:"executionMs"`
+	TotalMs     int64  `json:"totalMs"`
 }
 
 type LimitedBuffer struct {
@@ -77,16 +87,11 @@ func enableCORS(next http.Handler) http.Handler {
 			frontendURL = "http://localhost:3000"
 		}
 
-		w.Header().Set(
-			"Access-Control-Allow-Origin",
-			frontendURL,
-		)
-
+		w.Header().Set("Access-Control-Allow-Origin", frontendURL)
 		w.Header().Set(
 			"Access-Control-Allow-Methods",
 			"GET, POST, OPTIONS",
 		)
-
 		w.Header().Set(
 			"Access-Control-Allow-Headers",
 			"Content-Type",
@@ -114,7 +119,401 @@ func health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func getenv(key, fallback string) string {
+	value := os.Getenv(key)
+
+	if value == "" {
+		return fallback
+	}
+
+	return value
+}
+
+func removeContainer(name string) {
+	_ = exec.Command("docker", "rm", "-f", name).Run()
+}
+
+// ---------------------------------------------------------
+// Compile inside Docker compiler container
+// ---------------------------------------------------------
+
+func compileInDocker(
+	dir string,
+	image string,
+) (string, int, int64, error) {
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		compileTimeout,
+	)
+	defer cancel()
+
+	containerName := "golab-compile-" + filepath.Base(dir)
+
+	args := []string{
+		"run",
+		"--rm",
+		"--init",
+
+		// No network.
+		"--network", "none",
+
+		// Compiler resource limits.
+		"--memory", "512m",
+		"--memory-swap", "512m",
+		"--cpus", "1.0",
+		"--pids-limit", "128",
+
+		// Drop capabilities.
+		"--cap-drop", "ALL",
+
+		// Prevent privilege escalation.
+		"--security-opt", "no-new-privileges:true",
+
+		// Read-only root filesystem.
+		"--read-only",
+
+		// Writable temporary storage.
+		"--tmpfs",
+		"/tmp:rw,nosuid,nodev,size=256m",
+
+		// Non-root user.
+		"--user", "10001:10001",
+
+		// Persistent Go build cache across submissions.
+		"--mount",
+		"type=volume,source=golab-go-cache,target=/gocache",
+		"--env",
+		"GOCACHE=/gocache",
+
+		"--name",
+		containerName,
+
+		// Temporary submission workspace.
+		"--mount",
+		"type=bind,source=" + dir + ",target=/workspace",
+
+		"--workdir",
+		"/workspace",
+
+		image,
+
+		"go",
+		"build",
+		"-trimpath",
+		"-o",
+		"/workspace/program",
+		"/workspace/main.go",
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"docker",
+		args...,
+	)
+
+	var stdout LimitedBuffer
+	var stderr LimitedBuffer
+
+	stdout.Limit = maxOutputSize
+	stderr.Limit = maxOutputSize
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+
+	err := cmd.Run()
+
+	runtimeMs := time.Since(start).Milliseconds()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		log.Printf(
+			"Compilation timeout. Removing %s",
+			containerName,
+		)
+
+		removeContainer(containerName)
+
+		return "", 124, runtimeMs, ctx.Err()
+	}
+
+	exitCode := 0
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+
+	compileOutput := stderr.Buffer.String()
+
+	if compileOutput == "" {
+		compileOutput = stdout.Buffer.String()
+	}
+
+	return compileOutput, exitCode, runtimeMs, err
+}
+
+// ---------------------------------------------------------
+// Execute inside tiny runtime container
+// ---------------------------------------------------------
+
+func runInDocker(
+	dir string,
+	image string,
+	input string,
+) (string, string, int, int64, error) {
+
+	containerName := "golab-run-" + filepath.Base(dir)
+
+	// ---------------------------------------------------------
+	// Start container in detached mode
+	// ---------------------------------------------------------
+
+	args := []string{
+		"run",
+		"-d",
+		"--init",
+
+		// No network access.
+		"--network", "none",
+
+		// Runtime limits.
+		"--memory", "128m",
+		"--memory-swap", "128m",
+		"--cpus", "0.5",
+		"--pids-limit", "32",
+
+		// Security restrictions.
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges:true",
+
+		// Read-only root filesystem.
+		"--read-only",
+
+		// Writable temporary filesystem.
+		"--tmpfs",
+		"/tmp:rw,noexec,nosuid,nodev,size=32m",
+
+		// File limits.
+		"--ulimit",
+		"nofile=64:64",
+
+		"--ulimit",
+		"fsize=1048576:1048576",
+
+		"--ulimit",
+		"core=0",
+
+		// Non-root.
+		"--user",
+		"10001:10001",
+
+		"--name",
+		containerName,
+
+		// Read-only access to compiled binary.
+		"--mount",
+		"type=bind,source=" + dir + ",target=/workspace,readonly",
+
+		"--workdir",
+		"/workspace",
+
+		image,
+
+		"/workspace/program",
+	}
+
+	start := time.Now()
+
+	createCmd := exec.Command(
+		"docker",
+		args...,
+	)
+
+	// Detached container must receive stdin.
+	createCmd.Stdin = strings.NewReader(input)
+
+	containerIDBytes, err := createCmd.Output()
+
+	if err != nil {
+		runtimeMs := time.Since(start).Milliseconds()
+
+		var stderrText string
+
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderrText = string(exitErr.Stderr)
+		}
+
+		removeContainer(containerName)
+
+		return "",
+			stderrText,
+			1,
+			runtimeMs,
+			err
+	}
+
+	containerID := strings.TrimSpace(string(containerIDBytes))
+
+	if containerID == "" {
+		removeContainer(containerName)
+
+		return "",
+			"Failed to start Docker container.",
+			1,
+			time.Since(start).Milliseconds(),
+			nil
+	}
+
+	log.Printf(
+		"Docker runtime container started: %s",
+		containerID,
+	)
+
+	// ---------------------------------------------------------
+	// Wait for completion with 5-second timeout
+	// ---------------------------------------------------------
+
+	waitCtx, cancel := context.WithTimeout(
+		context.Background(),
+		runTimeout,
+	)
+	defer cancel()
+
+	waitCmd := exec.CommandContext(
+		waitCtx,
+		"docker",
+		"wait",
+		containerID,
+	)
+
+	exitOutput, waitErr := waitCmd.Output()
+
+	runtimeMs := time.Since(start).Milliseconds()
+
+	// ---------------------------------------------------------
+	// TIMEOUT
+	// ---------------------------------------------------------
+
+	if waitCtx.Err() == context.DeadlineExceeded {
+
+		log.Printf(
+			"Execution timeout. Killing %s",
+			containerID,
+		)
+
+		// Kill immediately.
+		_ = exec.Command(
+			"docker",
+			"kill",
+			containerID,
+		).Run()
+
+		// Fetch whatever output exists.
+		logOutput := exec.Command(
+			"docker",
+			"logs",
+			containerID,
+		)
+
+		outputBytes, _ := logOutput.CombinedOutput()
+
+		// Remove container.
+		_ = exec.Command(
+			"docker",
+			"rm",
+			"-f",
+			containerID,
+		).Run()
+
+		return "",
+			"Execution timed out after 5 seconds.\n\n" +
+				string(outputBytes),
+			124,
+			runtimeMs,
+			context.DeadlineExceeded
+	}
+
+	// ---------------------------------------------------------
+	// Docker wait error
+	// ---------------------------------------------------------
+
+	if waitErr != nil {
+		log.Printf(
+			"docker wait error: %v",
+			waitErr,
+		)
+
+		outputBytes, _ := exec.Command(
+			"docker",
+			"logs",
+			containerID,
+		).CombinedOutput()
+
+		removeContainer(containerID)
+
+		return "",
+			string(outputBytes),
+			1,
+			runtimeMs,
+			waitErr
+	}
+
+	// ---------------------------------------------------------
+	// Container finished
+	// ---------------------------------------------------------
+
+	exitCode := 0
+
+	exitText := strings.TrimSpace(
+		string(exitOutput),
+	)
+
+	if exitText != "" {
+		if parsed, parseErr := strconv.Atoi(exitText); parseErr == nil {
+			exitCode = parsed
+		}
+	}
+
+	// Get program output.
+	outputBytes, _ := exec.Command(
+		"docker",
+		"logs",
+		containerID,
+	).CombinedOutput()
+
+	// Remove container explicitly.
+	removeContainer(containerID)
+
+	output := string(outputBytes)
+
+	// Successful program.
+	if exitCode == 0 {
+		return output,
+			"",
+			0,
+			runtimeMs,
+			nil
+	}
+
+	// Runtime error / panic.
+	return "",
+		output,
+		exitCode,
+		runtimeMs,
+		nil
+}
+
+// ---------------------------------------------------------
+// POST /run
+// ---------------------------------------------------------
+
 func runCode(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{
 			"error": "Method not allowed",
@@ -122,8 +521,22 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit request body.
-	r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
+	// One execution at a time on the small server.
+	if !runLock.TryLock() {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error": "Runner is busy. Please try again in a moment.",
+		})
+		return
+	}
+
+	defer runLock.Unlock()
+
+	// Limit HTTP request body.
+	r.Body = http.MaxBytesReader(
+		w,
+		r.Body,
+		32*1024,
+	)
 
 	var req RunRequest
 
@@ -135,6 +548,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Code = strings.TrimSpace(req.Code)
+
+	// ---------------------------------------------------------
+	// Validation
+	// ---------------------------------------------------------
 
 	if req.Code == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -157,7 +574,17 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("========== NEW RUN ==========")
+	compilerImage := getenv(
+		"GOLAB_COMPILER_IMAGE",
+		defaultCompilerImage,
+	)
+
+	runtimeImage := getenv(
+		"GOLAB_RUNTIME_IMAGE",
+		defaultRuntimeImage,
+	)
+
+	log.Println("========== NEW DOCKER RUN ==========")
 	log.Printf("Code size: %d bytes", len(req.Code))
 	log.Printf("Input size: %d bytes", len(req.Input))
 
@@ -177,11 +604,21 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	defer os.RemoveAll(dir)
 
+	// Container user 10001 needs access.
+	if err := os.Chmod(dir, 0777); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "Could not configure workspace",
+		})
+		return
+	}
+
 	source := filepath.Join(dir, "main.go")
 
-	if err := os.WriteFile(source, []byte(req.Code), 0600); err != nil {
-		log.Printf("File write error: %v", err)
-
+	if err := os.WriteFile(
+		source,
+		[]byte(req.Code),
+		0644,
+	); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "Could not write source file",
 		})
@@ -190,99 +627,45 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Workspace: %s", dir)
 
-	// ---------------------------------------------------------
-	// Detect OS
-	// ---------------------------------------------------------
-
-	binaryName := "program"
-
-	if runtime.GOOS == "windows" {
-		binaryName += ".exe"
-	}
-
-	binary := filepath.Join(dir, binaryName)
+	// Total runner time starts after validation/workspace setup.
+	totalStart := time.Now()
 
 	// ---------------------------------------------------------
-	// Compilation
+	// COMPILE
 	// ---------------------------------------------------------
 
-	log.Println("Starting compilation...")
+	log.Println("Compiling inside Docker...")
 
-	compileCtx, compileCancel := context.WithTimeout(
-		context.Background(),
-		compileTimeout,
-	)
-	defer compileCancel()
-
-	compileCmd := exec.CommandContext(
-		compileCtx,
-		"go",
-		"build",
-		"-trimpath",
-		"-o",
-		binary,
-		source,
-	)
-
-	compileCmd.Dir = dir
-
-	compileCmd.Env = append(
-		os.Environ(),
-		"GOTOOLCHAIN=local",
-		"CGO_ENABLED=0",
-	)
-
-	var compileStdout LimitedBuffer
-	var compileStderr LimitedBuffer
-
-	compileStdout.Limit = maxOutputSize
-	compileStderr.Limit = maxOutputSize
-
-	compileCmd.Stdout = &compileStdout
-	compileCmd.Stderr = &compileStderr
-
-	compileStart := time.Now()
-
-	err = compileCmd.Run()
-
-	compileRuntime := time.Since(compileStart).Milliseconds()
-
-	log.Printf(
-		"Compilation finished in %d ms",
+	compileOutput,
+		compileExitCode,
 		compileRuntime,
+		compileErr := compileInDocker(
+		dir,
+		compilerImage,
 	)
 
-	// Compilation timeout.
-	if compileCtx.Err() == context.DeadlineExceeded {
-		log.Println("COMPILATION TIMEOUT")
-
+	if compileExitCode == 124 {
 		writeJSON(w, http.StatusOK, RunResponse{
-			Stdout:   "",
-			Stderr:   "Compilation timed out.",
-			ExitCode: 124,
-			Runtime:  compileRuntime,
+			Stdout:      "",
+			Stderr:      "Compilation timed out after 90 seconds.",
+			ExitCode:    124,
+			Runtime:     compileRuntime,
+			CompileMs:   compileRuntime,
+			ExecutionMs: 0,
+			TotalMs:     time.Since(totalStart).Milliseconds(),
 		})
 		return
 	}
 
-	// Compilation error.
-	if err != nil {
-		log.Printf(
-			"Compilation failed: %v",
-			err,
-		)
-
-		stderr := compileStderr.Buffer.String()
-
-		if stderr == "" {
-			stderr = compileStdout.Buffer.String()
-		}
-
+	if compileErr != nil {
 		writeJSON(w, http.StatusOK, RunResponse{
-			Stdout:   "",
-			Stderr:   stderr,
-			ExitCode: 1,
-			Runtime:  compileRuntime,
+			Stdout:      "",
+			Stderr:      compileOutput,
+			ExitCode:    compileExitCode,
+			Runtime:     compileRuntime,
+			CompileMs:   compileRuntime,
+			ExecutionMs: 0,
+			TotalMs:     time.Since(totalStart).Milliseconds(),
 		})
 		return
 	}
@@ -290,84 +673,59 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 	log.Println("Compilation successful")
 
 	// ---------------------------------------------------------
-	// Execution
+	// RUN
 	// ---------------------------------------------------------
 
-	log.Println("Starting execution...")
+	log.Println("Executing inside Docker...")
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		runTimeout,
-	)
-	defer cancel()
-
-	runCmd := exec.CommandContext(
-		ctx,
-		binary,
-	)
-
-	runCmd.Dir = dir
-
-	// stdin
-	runCmd.Stdin = strings.NewReader(req.Input)
-
-	var stdout LimitedBuffer
-	var stderr LimitedBuffer
-
-	stdout.Limit = maxOutputSize
-	stderr.Limit = maxOutputSize
-
-	runCmd.Stdout = &stdout
-	runCmd.Stderr = &stderr
-
-	start := time.Now()
-
-	err = runCmd.Run()
-
-	runtimeMs := time.Since(start).Milliseconds()
-
-	log.Printf(
-		"Execution finished in %d ms",
+	stdout,
+		stderr,
+		exitCode,
 		runtimeMs,
+		runErr := runInDocker(
+		dir,
+		runtimeImage,
+		req.Input,
 	)
 
-	// Timeout.
-	if ctx.Err() == context.DeadlineExceeded {
-		log.Println("EXECUTION TIMEOUT")
-
+	if exitCode == 124 {
 		writeJSON(w, http.StatusOK, RunResponse{
-			Stdout:   "",
-			Stderr:   "Execution timed out after 5 seconds.",
-			ExitCode: 124,
-			Runtime:  runtimeMs,
+			Stdout:      "",
+			Stderr:      "Execution timed out after 5 seconds.",
+			ExitCode:    124,
+			Runtime:     runtimeMs,
+			CompileMs:   compileRuntime,
+			ExecutionMs: runtimeMs,
+			TotalMs:     time.Since(totalStart).Milliseconds(),
 		})
 		return
 	}
 
-	// Runtime error / panic.
-	if err != nil {
-		log.Printf(
-			"Runtime error: %v",
-			err,
-		)
-
+	if runErr != nil {
 		writeJSON(w, http.StatusOK, RunResponse{
-			Stdout:   stdout.Buffer.String(),
-			Stderr:   stderr.Buffer.String(),
-			ExitCode: 1,
-			Runtime:  runtimeMs,
+			Stdout:      stdout,
+			Stderr:      stderr,
+			ExitCode:    exitCode,
+			Runtime:     runtimeMs,
+			CompileMs:   compileRuntime,
+			ExecutionMs: runtimeMs,
+			TotalMs:     time.Since(totalStart).Milliseconds(),
 		})
 		return
 	}
 
-	// Success.
-	log.Println("EXECUTION SUCCESS")
+	// ---------------------------------------------------------
+	// Result
+	// ---------------------------------------------------------
 
 	writeJSON(w, http.StatusOK, RunResponse{
-		Stdout:   stdout.Buffer.String(),
-		Stderr:   stderr.Buffer.String(),
-		ExitCode: 0,
-		Runtime:  runtimeMs,
+		Stdout:      stdout,
+		Stderr:      stderr,
+		ExitCode:    exitCode,
+		Runtime:     runtimeMs,
+		CompileMs:   compileRuntime,
+		ExecutionMs: runtimeMs,
+		TotalMs:     time.Since(totalStart).Milliseconds(),
 	})
 }
 
@@ -387,9 +745,17 @@ func main() {
 
 	address := "0.0.0.0:" + port
 
-	log.Printf("GoLab runner running on %s", address)
+	log.Printf(
+		"GoLab runner running on %s",
+		address,
+	)
 
-	if err := http.ListenAndServe(address, handler); err != nil {
+	log.Println("Docker sandbox mode enabled")
+
+	if err := http.ListenAndServe(
+		address,
+		handler,
+	); err != nil {
 		log.Fatal(err)
 	}
 }
