@@ -270,6 +270,7 @@ func runInDocker(
 
 	args := []string{
 		"run",
+		"-i",
 		"--init",
 
 		// No network access.
