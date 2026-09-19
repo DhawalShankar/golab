@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -121,10 +122,6 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	req.Code = strings.TrimSpace(req.Code)
 
-	// -----------------------------
-	// Validate input
-	// -----------------------------
-
 	if req.Code == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "Code cannot be empty",
@@ -134,24 +131,27 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Code) > maxCodeSize {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "Code too large. Maximum size is 10 KB.",
+			"error": "Code too large",
 		})
 		return
 	}
 
 	if len(req.Input) > maxInputSize {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "Input too large. Maximum size is 10 KB.",
+			"error": "Input too large",
 		})
 		return
 	}
 
-	// -----------------------------
-	// Temporary workspace
-	// -----------------------------
+	log.Println("========== NEW RUN ==========")
+	log.Printf("Code size: %d bytes\n", len(req.Code))
+	log.Printf("Input size: %d bytes\n", len(req.Input))
 
+	// Temporary workspace
 	dir, err := os.MkdirTemp("", "golab-*")
 	if err != nil {
+		log.Printf("ERROR creating temp directory: %v\n", err)
+
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "Could not create workspace",
 		})
@@ -160,19 +160,34 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	defer os.RemoveAll(dir)
 
+	log.Printf("Workspace: %s\n", dir)
+
 	source := filepath.Join(dir, "main.go")
 
 	if err := os.WriteFile(source, []byte(req.Code), 0600); err != nil {
+		log.Printf("ERROR writing source: %v\n", err)
+
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "Could not write source file",
 		})
 		return
 	}
 
-	// -----------------------------
-	// Binary name
-	// -----------------------------
+	log.Println("Source written successfully")
 
+	// Check Go installation
+	versionCmd := exec.Command("go", "version")
+
+	versionOutput, versionErr := versionCmd.CombinedOutput()
+
+	if versionErr != nil {
+		log.Printf("ERROR running 'go version': %v\n", versionErr)
+		log.Printf("Output: %s\n", string(versionOutput))
+	} else {
+		log.Printf("Go: %s\n", strings.TrimSpace(string(versionOutput)))
+	}
+
+	// Binary name
 	binaryName := "program"
 
 	if runtime.GOOS == "windows" {
@@ -181,15 +196,19 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	binary := filepath.Join(dir, binaryName)
 
-	// -----------------------------
-	// Compile
-	// -----------------------------
+	// ---------------------------------------------------------
+	// COMPILE
+	// ---------------------------------------------------------
+
+	log.Println("Starting compilation...")
 
 	compileCtx, compileCancel := context.WithTimeout(
 		context.Background(),
-		compileTimeout,
+		60*time.Second,
 	)
 	defer compileCancel()
+
+	compileStart := time.Now()
 
 	compileCmd := exec.CommandContext(
 		compileCtx,
@@ -202,39 +221,53 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	compileCmd.Dir = dir
 
-	var compileOutput LimitBuffer
-	compileOutput.Limit = maxOutputSize
+	compileOutput, err := compileCmd.CombinedOutput()
 
-	compileCmd.Stdout = &compileOutput
-	compileCmd.Stderr = &compileOutput
+	compileDuration := time.Since(compileStart)
 
-	err = compileCmd.Run()
+	log.Printf(
+		"Compilation finished after %d ms\n",
+		compileDuration.Milliseconds(),
+	)
 
-	// Compilation timeout
+	if len(compileOutput) > maxOutputSize {
+		compileOutput = compileOutput[:maxOutputSize]
+	}
+
+	log.Printf("Compile output: %s\n", string(compileOutput))
+
 	if compileCtx.Err() == context.DeadlineExceeded {
+		log.Println("COMPILATION TIMEOUT")
+
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
-			Stderr:   "Compilation timed out after 30 seconds.",
+			Stderr:   "Compilation timed out after 60 seconds.",
 			ExitCode: 124,
-			Runtime:  compileTimeout.Milliseconds(),
+			Runtime:  compileDuration.Milliseconds(),
 		})
 		return
 	}
 
-	// Compilation error
 	if err != nil {
+		log.Printf("COMPILATION ERROR: %v\n", err)
+
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
-			Stderr:   compileOutput.Buffer.String(),
+			Stderr:   string(compileOutput),
 			ExitCode: 1,
-			Runtime:  0,
+			Runtime:  compileDuration.Milliseconds(),
 		})
 		return
 	}
 
-	// -----------------------------
-	// Execute
-	// -----------------------------
+	log.Println("Compilation successful")
+	log.Printf("Binary: %s\n", binary)
+
+	// ---------------------------------------------------------
+	// EXECUTE
+	// ---------------------------------------------------------
+
+	log.Println("Starting program execution...")
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -243,14 +276,10 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	runCmd := exec.CommandContext(ctx, binary)
-
 	runCmd.Dir = dir
-
-	// stdin
 	runCmd.Stdin = strings.NewReader(req.Input)
 
-	var output LimitBuffer
-	output.Limit = maxOutputSize
+	var output bytes.Buffer
 
 	runCmd.Stdout = &output
 	runCmd.Stderr = &output
@@ -261,11 +290,17 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 
 	runtimeMs := time.Since(start).Milliseconds()
 
-	// -----------------------------
-	// Execution timeout
-	// -----------------------------
+	result := output.Bytes()
+
+	if len(result) > maxOutputSize {
+		result = result[:maxOutputSize]
+	}
+
+	log.Printf("Execution finished after %d ms\n", runtimeMs)
 
 	if ctx.Err() == context.DeadlineExceeded {
+		log.Println("EXECUTION TIMEOUT")
+
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
 			Stderr:   "Execution timed out after 5 seconds.",
@@ -275,26 +310,24 @@ func runCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// -----------------------------
-	// Runtime error / panic
-	// -----------------------------
-
 	if err != nil {
+		log.Printf("RUNTIME ERROR: %v\n", err)
+		log.Printf("Output: %s\n", string(result))
+
 		writeJSON(w, http.StatusOK, RunResponse{
 			Stdout:   "",
-			Stderr:   output.Buffer.String(),
+			Stderr:   string(result),
 			ExitCode: 1,
 			Runtime:  runtimeMs,
 		})
 		return
 	}
 
-	// -----------------------------
-	// Success
-	// -----------------------------
+	log.Println("EXECUTION SUCCESS")
+	log.Printf("Output: %s\n", string(result))
 
 	writeJSON(w, http.StatusOK, RunResponse{
-		Stdout:   output.Buffer.String(),
+		Stdout:   string(result),
 		Stderr:   "",
 		ExitCode: 0,
 		Runtime:  runtimeMs,
