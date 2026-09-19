@@ -269,14 +269,8 @@ func runInDocker(
 
 	containerName := "golab-run-" + filepath.Base(dir)
 
-	// ---------------------------------------------------------
-	// Start container in detached mode
-	// ---------------------------------------------------------
-
 	args := []string{
 		"run",
-		"-d",
-		"-i",
 		"--init",
 
 		// No network access.
@@ -310,15 +304,14 @@ func runInDocker(
 		"core=0",
 
 		// Non-root.
-		"--user",
-		"10001:10001",
+		"--user", "10001:10001",
 
 		"--name",
 		containerName,
 
 		// Read-only access to compiled binary.
 		"--mount",
-		"type=bind,source=" + dir + ",target=/workspace,readonly",
+		"type=bind,source="+dir+",target=/workspace,readonly",
 
 		"--workdir",
 		"/workspace",
@@ -328,71 +321,34 @@ func runInDocker(
 		"/workspace/program",
 	}
 
-	start := time.Now()
-
-	createCmd := exec.Command(
-		"docker",
-		args...,
-	)
-
-	// Detached container must receive stdin.
-	createCmd.Stdin = strings.NewReader(input)
-
-	containerIDBytes, err := createCmd.Output()
-
-	if err != nil {
-		runtimeMs := time.Since(start).Milliseconds()
-
-		var stderrText string
-
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderrText = string(exitErr.Stderr)
-		}
-
-		removeContainer(containerName)
-
-		return "",
-			stderrText,
-			1,
-			runtimeMs,
-			err
-	}
-
-	containerID := strings.TrimSpace(string(containerIDBytes))
-
-	if containerID == "" {
-		removeContainer(containerName)
-
-		return "",
-			"Failed to start Docker container.",
-			1,
-			time.Since(start).Milliseconds(),
-			nil
-	}
-
-	log.Printf(
-		"Docker runtime container started: %s",
-		containerID,
-	)
-
-	// ---------------------------------------------------------
-	// Wait for completion with 5-second timeout
-	// ---------------------------------------------------------
-
-	waitCtx, cancel := context.WithTimeout(
+	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		runTimeout,
 	)
 	defer cancel()
 
-	waitCmd := exec.CommandContext(
-		waitCtx,
+	cmd := exec.CommandContext(
+		ctx,
 		"docker",
-		"wait",
-		containerID,
+		args...,
 	)
 
-	exitOutput, waitErr := waitCmd.Output()
+	// IMPORTANT:
+	// Attached mode means program receives stdin directly.
+	cmd.Stdin = strings.NewReader(input)
+
+	var stdout LimitedBuffer
+	var stderr LimitedBuffer
+
+	stdout.Limit = maxOutputSize
+	stderr.Limit = maxOutputSize
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+
+	err := cmd.Run()
 
 	runtimeMs := time.Since(start).Milliseconds()
 
@@ -400,111 +356,51 @@ func runInDocker(
 	// TIMEOUT
 	// ---------------------------------------------------------
 
-	if waitCtx.Err() == context.DeadlineExceeded {
-
+	if ctx.Err() == context.DeadlineExceeded {
 		log.Printf(
 			"Execution timeout. Killing %s",
-			containerID,
+			containerName,
 		)
 
-		// Kill immediately.
-		_ = exec.Command(
-			"docker",
-			"kill",
-			containerID,
-		).Run()
-
-		// Fetch whatever output exists.
-		logOutput := exec.Command(
-			"docker",
-			"logs",
-			containerID,
-		)
-
-		outputBytes, _ := logOutput.CombinedOutput()
-
-		// Remove container.
-		_ = exec.Command(
-			"docker",
-			"rm",
-			"-f",
-			containerID,
-		).Run()
+		removeContainer(containerName)
 
 		return "",
-			"Execution timed out after 5 seconds.\n\n" +
-				string(outputBytes),
+			"Execution timed out after 5 seconds.",
 			124,
 			runtimeMs,
 			context.DeadlineExceeded
 	}
 
 	// ---------------------------------------------------------
-	// Docker wait error
+	// Docker / runtime error
 	// ---------------------------------------------------------
 
-	if waitErr != nil {
-		log.Printf(
-			"docker wait error: %v",
-			waitErr,
-		)
+	if err != nil {
+		exitCode := 1
 
-		outputBytes, _ := exec.Command(
-			"docker",
-			"logs",
-			containerID,
-		).CombinedOutput()
-
-		removeContainer(containerID)
-
-		return "",
-			string(outputBytes),
-			1,
-			runtimeMs,
-			waitErr
-	}
-
-	// ---------------------------------------------------------
-	// Container finished
-	// ---------------------------------------------------------
-
-	exitCode := 0
-
-	exitText := strings.TrimSpace(
-		string(exitOutput),
-	)
-
-	if exitText != "" {
-		if parsed, parseErr := strconv.Atoi(exitText); parseErr == nil {
-			exitCode = parsed
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
 		}
-	}
 
-	// Get program output.
-	outputBytes, _ := exec.Command(
-		"docker",
-		"logs",
-		containerID,
-	).CombinedOutput()
+		// Remove container if it still exists.
+		removeContainer(containerName)
 
-	// Remove container explicitly.
-	removeContainer(containerID)
-
-	output := string(outputBytes)
-
-	// Successful program.
-	if exitCode == 0 {
-		return output,
-			"",
-			0,
+		return stdout.Buffer.String(),
+			stderr.Buffer.String(),
+			exitCode,
 			runtimeMs,
-			nil
+			err
 	}
 
-	// Runtime error / panic.
-	return "",
-		output,
-		exitCode,
+	// ---------------------------------------------------------
+	// Successful execution
+	// ---------------------------------------------------------
+
+	removeContainer(containerName)
+
+	return stdout.Buffer.String(),
+		stderr.Buffer.String(),
+		0,
 		runtimeMs,
 		nil
 }
