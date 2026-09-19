@@ -1,0 +1,16 @@
+# Node
+node_modules/
+.next/
+out/
+
+# Go
+backend/app
+backend/*.exe
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
