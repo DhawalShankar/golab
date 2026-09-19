@@ -96,7 +96,14 @@ export default function Home() {
           <Image src="/logo.svg" alt="" width={30} height={30} priority />
           <div className="golab-brand-text">
             <span className="golab-name">GoLab</span>
-            <span className="golab-by">by GolangForAll</span>
+            <a
+              className="golab-by"
+              href="https://golangforall.in"
+              target="_blank"
+              rel="noreferrer"
+            >
+              by GolangForAll
+            </a>
           </div>
         </div>
         <a
@@ -291,6 +298,12 @@ export default function Home() {
           font-size: 10.5px;
           color: var(--muted);
           margin-top: 1px;
+          text-decoration: none;
+          transition: color 0.15s ease;
+        }
+
+        .golab-by:hover {
+          color: var(--cyan);
         }
 
         .golab-link {
