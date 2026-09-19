@@ -21,6 +21,9 @@ type RunResponse = {
   stderr: string;
   exitCode: number;
   runtimeMs: number;
+  compileMs?: number;
+  executionMs?: number;
+  totalMs?: number;
 };
 
 type RunState = "idle" | "running" | "ok" | "error" | "connection-error";
@@ -31,6 +34,9 @@ export default function Home() {
   const [stdout, setStdout] = useState("");
   const [stderr, setStderr] = useState("");
   const [runtimeMs, setRuntimeMs] = useState<number | null>(null);
+  const [compileMs, setCompileMs] = useState<number | null>(null);
+  const [executionMs, setExecutionMs] = useState<number | null>(null);
+  const [totalMs, setTotalMs] = useState<number | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [state, setState] = useState<RunState>("idle");
 
@@ -39,6 +45,9 @@ export default function Home() {
     setStdout("");
     setStderr("");
     setRuntimeMs(null);
+    setCompileMs(null);
+    setExecutionMs(null);
+    setTotalMs(null);
     setExitCode(null);
 
     try {
@@ -71,6 +80,9 @@ export default function Home() {
       setStdout(data.stdout ?? "");
       setStderr(data.stderr ?? "");
       setRuntimeMs(data.runtimeMs);
+      setCompileMs(data.compileMs ?? null);
+      setExecutionMs(data.executionMs ?? null);
+      setTotalMs(data.totalMs ?? null);
       setExitCode(data.exitCode);
       setState(data.exitCode === 0 ? "ok" : "error");
     } catch (err) {
@@ -224,7 +236,13 @@ export default function Home() {
               </b>
             </span>
             <span>
-              runtime: <b>{runtimeMs != null ? `${runtimeMs} ms` : "—"}</b>
+              compile: <b>{compileMs != null ? `${compileMs} ms` : "—"}</b>
+            </span>
+            <span>
+              exec: <b>{executionMs != null ? `${executionMs} ms` : "—"}</b>
+            </span>
+            <span>
+              total: <b>{totalMs != null ? `${totalMs} ms` : "—"}</b>
             </span>
           </div>
         </section>
@@ -506,7 +524,8 @@ export default function Home() {
         .output-status {
           flex: 0 0 auto;
           display: flex;
-          gap: 20px;
+          flex-wrap: wrap;
+          gap: 14px 20px;
           padding: 8px 14px;
           border-top: 1px solid var(--panel-border);
           background: #11161d;
